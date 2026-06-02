@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import tiktoken
+import time
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -11,7 +12,7 @@ if torch.cuda.is_available():
 elif torch.mps.is_available():
 	device = 'mps';
 
-# device = 'cpu'
+device = 'cpu'
 
 print(f'Using device {device}')
 
@@ -25,7 +26,7 @@ class DataLoaderLite:
 		tokens = enc.encode(text)
 		self.tokens = torch.tensor(tokens)
 		print(f'Loaded {len(self.tokens)} tokens')
-		print(f'1 epoch = {len(self.tokens) // B*T} batches')
+		print(f'1 epoch = {len(self.tokens) // (B*T)} batches')
 		self.current_position = 0
 
 	def next_batch(self):
@@ -117,7 +118,7 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
 
-	def __init__(self, config):
+	def __init__(self, config: GPTConfig):
 		super().__init__()
 		self.config = config
 
@@ -131,6 +132,8 @@ class GPT(nn.Module):
 
 		# weight sharing scheme -- words with the same encoding meaning should have similar prediction outputs at the end
 		self.wte.weight = self.lm_head.weight
+		for name, module in self.named_modules():
+			self._init_weights(name, module)
 
 	def forward(self, idx, targets=None):
 		# idx is (B, T)
@@ -154,7 +157,18 @@ class GPT(nn.Module):
 		if targets is not None:
 			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 		return logits, loss
-		
+	
+	# TODO: check if this actually does anything at all
+	def _init_weights(self, name, module):
+		if isinstance(module, nn.Linear):
+			std = 0.02
+			if name.endswith('c_proj'):
+				std *= (2*self.config.n_layer) ** -0.5 # 1/sqrt(nLayers)
+			torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+			if module.bias is not None:
+				torch.nn.init.zeros_(module.bias)
+		elif isinstance(module, nn.Embedding):
+			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
 def sample_random_model():
@@ -194,9 +208,8 @@ def sample_random_model():
 with open('tinyshakespeare.txt', 'r') as f:
 	tinyshakespeare = f.read()
 
-B, T = 4, 32
-
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
+torch.set_float32_matmul_precision('high')
 
 
 model = GPT(GPTConfig())
@@ -206,6 +219,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, foreach=False, fused=
 
 for i in range(50):
 	# these are already on the gpu
+	t0 = time.time()
 	x, y = train_loader.next_batch()
 
 	optimizer.zero_grad()
@@ -213,5 +227,10 @@ for i in range(50):
 		logits,loss = model(x, y)
 	loss.backward()
 	optimizer.step()
-	print(f'step {i} loss: {loss.item()}')
+	if (device == 'mps'):
+		torch.mps.synchronize()
+	if (device == 'cuda'):
+		torch.cuda.synchronize()
+	dt = time.time()-t0
+	print(f'step {i} loss: {loss.item()} dt={dt:.2f}')
  
